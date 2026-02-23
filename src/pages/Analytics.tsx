@@ -43,7 +43,7 @@ import {
 } from 'recharts';
 import { supabase } from '@/integrations/supabase/client';
 import { Location } from '@/types/database';
-import { format, subDays } from 'date-fns';
+import { format, subDays, differenceInMinutes, getHours, startOfMonth, eachMonthOfInterval, subMonths } from 'date-fns';
 import { DateRange } from 'react-day-picker';
 import { cn } from '@/lib/utils';
 
@@ -147,7 +147,56 @@ export default function Analytics() {
       .from('gates')
       .select('id, status, location_id');
 
-    // Calculate location stats
+    // Fetch all visitors with check_in/out times for avg duration and peak hour calculation
+    let allVisitorsQuery = supabase
+      .from('visitors')
+      .select('check_in_time, check_out_time, gate:gates(location_id)');
+    if (dateRange?.from) {
+      allVisitorsQuery = allVisitorsQuery.gte('created_at', dateRange.from.toISOString());
+    }
+    if (dateRange?.to) {
+      const endOfDay = new Date(dateRange.to);
+      endOfDay.setHours(23, 59, 59, 999);
+      allVisitorsQuery = allVisitorsQuery.lte('created_at', endOfDay.toISOString());
+    }
+    const { data: allVisitorsFull } = await allVisitorsQuery;
+
+    // Calculate avg duration
+    let avgDuration = 'N/A';
+    if (allVisitorsFull) {
+      const completedVisits = allVisitorsFull.filter(
+        (v: any) => v.check_in_time && v.check_out_time
+      );
+      const validDurations = completedVisits
+        .map((v: any) => differenceInMinutes(new Date(v.check_out_time), new Date(v.check_in_time)))
+        .filter((m: number) => m > 0);
+      if (validDurations.length > 0) {
+        const avgMins = Math.round(validDurations.reduce((a: number, b: number) => a + b, 0) / validDurations.length);
+        const h = Math.floor(avgMins / 60);
+        const m = avgMins % 60;
+        avgDuration = `${h}h ${m}m`;
+      }
+    }
+
+    // Calculate peak hour (hour 0-23 with most check-ins)
+    let peakHour = 'N/A';
+    if (allVisitorsFull) {
+      const hourCounts: Record<number, number> = {};
+      allVisitorsFull.forEach((v: any) => {
+        if (v.check_in_time) {
+          const h = getHours(new Date(v.check_in_time));
+          hourCounts[h] = (hourCounts[h] || 0) + 1;
+        }
+      });
+      const hours = Object.entries(hourCounts);
+      if (hours.length > 0) {
+        const peakH = parseInt(hours.sort((a, b) => b[1] - a[1])[0][0]);
+        const amPm = peakH >= 12 ? 'PM' : 'AM';
+        const displayH = peakH % 12 === 0 ? 12 : peakH % 12;
+        peakHour = `${displayH}:00 ${amPm}`;
+      }
+    }
+
     if (locationsData && visitorsData && vehiclesData) {
       const stats: LocationStats[] = locationsData.map((location, index) => {
         const visitorCount = visitorsData.filter(
@@ -167,7 +216,6 @@ export default function Analytics() {
 
       setLocationStats(stats);
 
-      // Calculate totals
       const totalVisitors = visitorsData.length;
       const totalVehicles = vehiclesData.length;
       const activeGates = gatesData?.filter((g) => g.status === 'active').length || 0;
@@ -178,19 +226,35 @@ export default function Analytics() {
         vehicles: totalVehicles,
         activeGates,
         totalGates,
-        avgDuration: '1h 42m',
-        peakHour: '10:00 AM',
+        avgDuration,
+        peakHour,
       });
     }
 
-    // Generate trend data (last 6 months)
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'];
-    const mockTrend = months.map((month, i) => ({
-      month,
-      visitors: Math.floor(Math.random() * 500) + 200 + i * 50,
-      vehicles: Math.floor(Math.random() * 200) + 50 + i * 20,
-    }));
-    setTrendData(mockTrend);
+    // Real monthly trend — last 6 months from today
+    const today = new Date();
+    const sixMonthsAgo = subMonths(today, 5);
+    const monthStarts = eachMonthOfInterval({ start: startOfMonth(sixMonthsAgo), end: startOfMonth(today) });
+
+    const trendResults: TrendData[] = await Promise.all(
+      monthStarts.map(async (monthStart) => {
+        const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0, 23, 59, 59, 999);
+        const [{ count: vCount }, { count: vcCount }] = await Promise.all([
+          supabase.from('visitors').select('id', { count: 'exact', head: true })
+            .gte('created_at', monthStart.toISOString())
+            .lte('created_at', monthEnd.toISOString()),
+          supabase.from('vehicles').select('id', { count: 'exact', head: true })
+            .gte('created_at', monthStart.toISOString())
+            .lte('created_at', monthEnd.toISOString()),
+        ]);
+        return {
+          month: format(monthStart, 'MMM'),
+          visitors: vCount || 0,
+          vehicles: vcCount || 0,
+        };
+      })
+    );
+    setTrendData(trendResults);
 
     setLoading(false);
   };

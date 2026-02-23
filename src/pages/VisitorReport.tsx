@@ -78,6 +78,7 @@ export default function VisitorReport() {
 
   useEffect(() => {
     fetchLocations();
+    fetchVisitors(); // initial load
   }, []);
 
   useEffect(() => {
@@ -109,13 +110,22 @@ export default function VisitorReport() {
       `)
       .order('created_at', { ascending: false });
 
-    if (dateRange?.from) {
-      query = query.gte('created_at', dateRange.from.toISOString());
-    }
-    if (dateRange?.to) {
-      const endOfDay = new Date(dateRange.to);
+    // Build date filter: include visitor if created_at, check_in_time, OR check_out_time falls within range
+    // This ensures checked-out visitors are never hidden just because they were registered earlier
+    if (dateRange?.from || dateRange?.to) {
+      const fromISO = dateRange?.from?.toISOString() ?? '1970-01-01T00:00:00.000Z';
+      const endOfDay = dateRange?.to ? new Date(dateRange.to) : new Date();
       endOfDay.setHours(23, 59, 59, 999);
-      query = query.lte('created_at', endOfDay.toISOString());
+      const toISO = endOfDay.toISOString();
+
+      // Include any visitor active within the date range (registered, checked-in, or checked-out)
+      query = query.or(
+        [
+          `and(created_at.gte.${fromISO},created_at.lte.${toISO})`,
+          `and(check_in_time.gte.${fromISO},check_in_time.lte.${toISO})`,
+          `and(check_out_time.gte.${fromISO},check_out_time.lte.${toISO})`,
+        ].join(',')
+      );
     }
 
     const { data } = await query;
@@ -212,12 +222,16 @@ export default function VisitorReport() {
       checkOuts: data.checkOuts,
     }));
 
-    // Status distribution
+    // Status distribution — compute directly from visitors array (not stale stats state)
+    const checkedInCount = visitors.filter(v => v.status === 'checked_in').length;
+    const checkedOutCount = visitors.filter(v => v.status === 'checked_out').length;
+    const scheduledCount = visitors.filter(v => v.status === 'scheduled').length;
+    const pendingCount = visitors.filter(v => v.status === 'pending_approval').length;
     const statusDistribution = [
-      { name: 'Currently Inside', value: stats.checkedIn, color: '#10b981' },
-      { name: 'Checked Out', value: stats.checkedOut, color: '#64748b' },
-      { name: 'Scheduled', value: visitors.filter(v => v.status === 'scheduled').length, color: '#3b82f6' },
-      { name: 'Pending Approval', value: visitors.filter(v => v.status === 'pending_approval').length, color: '#f59e0b' },
+      { name: 'Currently Inside', value: checkedInCount, color: '#10b981' },
+      { name: 'Checked Out', value: checkedOutCount, color: '#64748b' },
+      { name: 'Scheduled', value: scheduledCount, color: '#3b82f6' },
+      { name: 'Pending Approval', value: pendingCount, color: '#f59e0b' },
     ].filter(s => s.value > 0);
 
     // Top 10 visitors by visit count (grouped by name + company)
